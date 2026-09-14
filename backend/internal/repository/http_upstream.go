@@ -1475,6 +1475,17 @@ func buildUpstreamTransportWithTLSFingerprint(settings poolSettings, proxyURL *u
 			slog.Debug("tls_fingerprint_transport_http_connect", "proxy", proxyURL.Host)
 			httpDialer := tlsfingerprint.NewHTTPProxyDialer(profile, proxyURL)
 			transport.DialTLSContext = httpDialer.DialTLSContext
+			// Plain HTTP 不会走 DialTLSContext。仅对 http 请求启用 Transport.Proxy；
+			// https 必须返回 nil，否则 Go 会把 DialTLSContext 的 addr 设成代理地址，
+			// 与 HTTPProxyDialer（期望目标 addr 并自行 CONNECT）冲突。
+			proxyCopy := *proxyURL
+			transport.Proxy = func(req *http.Request) (*url.URL, error) {
+				if req != nil && req.URL != nil && strings.EqualFold(req.URL.Scheme, "https") {
+					return nil, nil
+				}
+				u := proxyCopy
+				return &u, nil
+			}
 		default:
 			// 未知代理类型，回退到普通代理配置（无 TLS 指纹）
 			slog.Debug("tls_fingerprint_transport_unknown_scheme_fallback", "scheme", scheme)
