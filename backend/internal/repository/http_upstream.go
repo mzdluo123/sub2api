@@ -1079,6 +1079,7 @@ func isOpenAIHTTP2CompatibilityError(err error) bool {
 		"goaway",
 		"refused_stream",
 		"frame too large",
+		"malformed http response",
 	}
 	for _, marker := range markers {
 		if strings.Contains(msg, marker) {
@@ -1329,14 +1330,13 @@ func newUpstreamDialer() *net.Dialer {
 //   - IdleConnTimeout: 空闲连接超时（超时后关闭）
 //   - ResponseHeaderTimeout: 等待响应头超时（不影响流式传输）
 func buildUpstreamTransport(settings poolSettings, proxyURL *url.URL, protocolMode string) (*http.Transport, error) {
+	// 抓包 Client Hello 无 ALPN（JA3 无扩展 16）。若在 utls DialTLSContext 上再开
+	// ForceAttemptHTTP2 / WithHTTP2ALPN，服务端会按 h2 回 SETTINGS 帧，而 net/http 仍走
+	// HTTP/1.1 解析，出现：
+	//   malformed HTTP response "\x00\x00\x12\x04..." （HTTP/2 SETTINGS）
+	// 因此指纹主路径固定 HTTP/1.1，与抓包一致；HTTPS 代理回退 stdlib 仍可按 protocolMode 开 H2。
 	profile := tlsfingerprint.DefaultUpstreamClientHelloProfile()
-	needsH2 := protocolMode == upstreamProtocolModeLongStreamH2 || protocolMode == upstreamProtocolModeOpenAIH2
-	if needsH2 {
-		// 抓包 Client Hello 无 ALPN；HTTP/2 协商必须带 h2 ALPN，JA3 会因此与抓包略有差异。
-		profile = tlsfingerprint.WithHTTP2ALPN(profile)
-	}
 
-	// HTTPS 代理无法走 utls CONNECT 前言，回退到 stdlib Transport（仍挂显式 tls.Config）。
 	if proxyURL != nil && strings.EqualFold(proxyURL.Scheme, "https") {
 		return buildUpstreamTransportStdlib(settings, proxyURL, protocolMode, true)
 	}
@@ -1345,17 +1345,8 @@ func buildUpstreamTransport(settings poolSettings, proxyURL *url.URL, protocolMo
 	if err != nil {
 		return nil, err
 	}
-	// Fingerprint builder 默认 ForceAttemptHTTP2=false；按协议模式再覆盖。
-	switch protocolMode {
-	case upstreamProtocolModeLongStreamH2, upstreamProtocolModeOpenAIH2:
-		transport.ForceAttemptHTTP2 = true
-		if _, err := enableHTTP2KeepAlive(transport); err != nil {
-			return nil, err
-		}
-	case upstreamProtocolModeOpenAIH1, upstreamProtocolModeOpenAIH1Fallback:
-		transport.ForceAttemptHTTP2 = false
-		transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
-	}
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
 	return transport, nil
 }
 

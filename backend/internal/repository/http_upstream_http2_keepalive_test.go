@@ -50,12 +50,32 @@ func TestEnableHTTP2KeepAlive_EnablesPingHealthCheck(t *testing.T) {
 	requireHTTP2Configured(t, tr, "http2 必须已挂到底层 http.Transport 上")
 }
 
-// long_stream_h2 模式构建的 Transport 必须带上 H2 PING 健康探测，从源头剔除死连接。
+// long_stream_h2 / openai_h2 在 utls 指纹主路径上强制 HTTP/1.1（抓包无 ALPN），
+// H2 keepalive 只挂在 stdlib 回退路径（如 HTTPS 代理）。
 func TestBuildUpstreamTransport_LongStreamH2_EnablesPingHealthCheck(t *testing.T) {
-	tr, err := buildUpstreamTransport(http2KeepAliveTestPoolSettings(), nil, upstreamProtocolModeLongStreamH2)
+	tr, err := buildUpstreamTransportStdlib(http2KeepAliveTestPoolSettings(), nil, upstreamProtocolModeLongStreamH2, true)
 	require.NoError(t, err)
-	require.True(t, tr.ForceAttemptHTTP2, "long_stream_h2 必须启用 HTTP/2")
-	requireHTTP2Configured(t, tr, "long_stream_h2 必须显式配置 http2 以启用 ReadIdleTimeout")
+	require.True(t, tr.ForceAttemptHTTP2, "stdlib long_stream_h2 必须启用 HTTP/2")
+	requireHTTP2Configured(t, tr, "stdlib long_stream_h2 必须显式配置 http2 以启用 ReadIdleTimeout")
+}
+
+// 指纹主路径（含 openai_h2 / long_stream_h2 协议标签）必须禁用 H2，避免 ALPN=h2
+// 后仍按 HTTP/1.1 读响应导致 malformed HTTP response。
+func TestBuildUpstreamTransport_FingerprintPathForcesHTTP1(t *testing.T) {
+	for _, mode := range []string{
+		upstreamProtocolModeDefault,
+		upstreamProtocolModeLongStreamH2,
+		upstreamProtocolModeOpenAIH2,
+		upstreamProtocolModeOpenAIH1,
+	} {
+		tr, err := buildUpstreamTransport(http2KeepAliveTestPoolSettings(), nil, mode)
+		require.NoError(t, err, mode)
+		require.False(t, tr.ForceAttemptHTTP2, mode)
+		require.NotNil(t, tr.DialTLSContext, mode)
+		require.NotNil(t, tr.TLSNextProto, mode)
+		_, hasH2 := tr.TLSNextProto["h2"]
+		require.False(t, hasH2, mode)
+	}
 }
 
 // 非 H2 模式（default/h1）不应在构建期主动配置 http2 keepalive：
@@ -103,24 +123,24 @@ func TestBuildUpstreamTransport_DefaultUsesCapturedTLSFingerprintDialer(t *testi
 	require.NoError(t, err)
 	require.NotNil(t, tr.DialTLSContext, "默认上游必须挂 utls DialTLSContext 以复现抓包 Client Hello")
 	require.NotNil(t, tr.DialContext, "TCP 建连仍须带超时 dialer")
-
-	h2, err := buildUpstreamTransport(http2KeepAliveTestPoolSettings(), nil, upstreamProtocolModeLongStreamH2)
-	require.NoError(t, err)
-	require.NotNil(t, h2.DialTLSContext, "H2 模式同样走指纹 dialer（带 ALPN）")
-	require.True(t, h2.ForceAttemptHTTP2)
-	requireHTTP2Configured(t, h2, "H2 模式必须显式配置 http2 keepalive")
+	require.False(t, tr.ForceAttemptHTTP2, "指纹路径强制 HTTP/1.1")
 }
 
 // 死连接在经 HTTP 代理（CONNECT 隧道）时最高发，这是带 proxy 账号的真实生产路径：
-// long_stream_h2 经 http 代理走 utls HTTPProxyDialer（DialTLSContext 内 CONNECT），
-// 仍须挂上 http2 keepalive。
+// 指纹主路径对 http 代理走 DialTLSContext（无 H2）；stdlib HTTPS 代理路径才挂 H2 keepalive。
 func TestBuildUpstreamTransport_LongStreamH2_WithHTTPProxy_EnablesKeepAlive(t *testing.T) {
 	proxyURL, err := url.Parse("http://127.0.0.1:8080")
 	require.NoError(t, err)
 
 	tr, err := buildUpstreamTransport(http2KeepAliveTestPoolSettings(), proxyURL, upstreamProtocolModeLongStreamH2)
 	require.NoError(t, err)
-	require.True(t, tr.ForceAttemptHTTP2)
-	requireHTTP2Configured(t, tr, "经代理的 long_stream_h2 也必须启用 http2 keepalive")
+	require.False(t, tr.ForceAttemptHTTP2, "utls http 代理路径强制 HTTP/1.1")
 	require.NotNil(t, tr.DialTLSContext, "http 代理经指纹 dialer 的 CONNECT+TLS")
+
+	httpsProxy, err := url.Parse("https://127.0.0.1:8443")
+	require.NoError(t, err)
+	h2, err := buildUpstreamTransport(http2KeepAliveTestPoolSettings(), httpsProxy, upstreamProtocolModeLongStreamH2)
+	require.NoError(t, err)
+	require.True(t, h2.ForceAttemptHTTP2)
+	requireHTTP2Configured(t, h2, "HTTPS 代理 stdlib 回退路径仍须启用 http2 keepalive")
 }
