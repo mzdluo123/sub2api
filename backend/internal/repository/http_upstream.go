@@ -1399,22 +1399,20 @@ func buildUpstreamTransportStdlib(settings poolSettings, proxyURL *url.URL, prot
 
 // defaultUpstreamTLSClientConfig 将 DefaultUpstreamClientHelloProfile 映射为 crypto/tls.Config。
 // 用于 HTTPS 代理等无法挂 utls DialTLSContext 的回退路径。
+//
+// 注意：Go 1.27 的 crypto/tls.Config 已不再暴露 SignatureSchemes；签名算法仅由
+// utls Profile（DefaultUpstreamClientHelloProfile）在主路径精确控制。
 func defaultUpstreamTLSClientConfig() *tls.Config {
 	p := tlsfingerprint.DefaultUpstreamClientHelloProfile()
 	curves := make([]tls.CurveID, len(p.Curves))
 	for i, c := range p.Curves {
 		curves[i] = tls.CurveID(c)
 	}
-	sigAlgs := make([]tls.SignatureScheme, len(p.SignatureAlgorithms))
-	for i, s := range p.SignatureAlgorithms {
-		sigAlgs[i] = tls.SignatureScheme(s)
-	}
 	return &tls.Config{
 		MinVersion:       tls.VersionTLS12,
 		MaxVersion:       tls.VersionTLS12,
 		CipherSuites:     append([]uint16(nil), p.CipherSuites...),
 		CurvePreferences: curves,
-		SignatureSchemes: sigAlgs,
 	}
 }
 
