@@ -58,17 +58,21 @@ func TestBuildUpstreamTransport_LongStreamH2_EnablesPingHealthCheck(t *testing.T
 	requireHTTP2Configured(t, tr, "long_stream_h2 必须显式配置 http2 以启用 ReadIdleTimeout")
 }
 
-// 非 H2 模式（default/h1）不应因本次改动被误配置：default 走 Go 自动 H2（惰性配置，
-// 构建时 Protocols/TLSNextProto 仍为空），h1 模式显式禁用 H2。避免波及 Claude/Gemini 热路径。
+// 非 H2 模式（default/h1）不应在构建期主动配置 http2 keepalive：
+// default 走抓包 TLS1.2 Client Hello（无 ALPN），h1 模式显式禁用 H2。
 func TestBuildUpstreamTransport_NonLongStreamH2_NotEagerlyConfigured(t *testing.T) {
 	tr, err := buildUpstreamTransport(http2KeepAliveTestPoolSettings(), nil, upstreamProtocolModeDefault)
 	require.NoError(t, err)
 	require.Nil(t, tr.Protocols, "default 模式不应在构建期主动配置 http2 keepalive")
 	require.Nil(t, tr.TLSNextProto["h2"], "default 模式不应在构建期主动配置 http2 keepalive")
+	require.False(t, tr.ForceAttemptHTTP2)
 }
 
 // long_stream_h2 模式构建的 Transport 必须真正以 HTTP/2 与上游通信，PING 健康探测才有载体：
 // 自定义 DialContext 下 Go 不会自动启用 H2，全靠 enableHTTP2KeepAlive 的显式配置。
+//
+// 真实上游默认走 utls DialTLSContext（不读 TLSClientConfig.RootCAs），自签 httptest
+// 无法注入信任锚。此处用 stdlib 回退路径验证 H2 协商与 keepalive 挂载本身正确。
 func TestBuildUpstreamTransport_LongStreamH2_NegotiatesHTTP2(t *testing.T) {
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -77,7 +81,7 @@ func TestBuildUpstreamTransport_LongStreamH2_NegotiatesHTTP2(t *testing.T) {
 	srv.StartTLS()
 	defer srv.Close()
 
-	tr, err := buildUpstreamTransport(http2KeepAliveTestPoolSettings(), nil, upstreamProtocolModeLongStreamH2)
+	tr, err := buildUpstreamTransportStdlib(http2KeepAliveTestPoolSettings(), nil, upstreamProtocolModeLongStreamH2, true)
 	require.NoError(t, err)
 	defer tr.CloseIdleConnections()
 	require.NotNil(t, tr.TLSClientConfig)
@@ -94,8 +98,22 @@ func TestBuildUpstreamTransport_LongStreamH2_NegotiatesHTTP2(t *testing.T) {
 	require.Equal(t, 2, resp.ProtoMajor, "long_stream_h2 必须协商到 HTTP/2")
 }
 
+func TestBuildUpstreamTransport_DefaultUsesCapturedTLSFingerprintDialer(t *testing.T) {
+	tr, err := buildUpstreamTransport(http2KeepAliveTestPoolSettings(), nil, upstreamProtocolModeDefault)
+	require.NoError(t, err)
+	require.NotNil(t, tr.DialTLSContext, "默认上游必须挂 utls DialTLSContext 以复现抓包 Client Hello")
+	require.NotNil(t, tr.DialContext, "TCP 建连仍须带超时 dialer")
+
+	h2, err := buildUpstreamTransport(http2KeepAliveTestPoolSettings(), nil, upstreamProtocolModeLongStreamH2)
+	require.NoError(t, err)
+	require.NotNil(t, h2.DialTLSContext, "H2 模式同样走指纹 dialer（带 ALPN）")
+	require.True(t, h2.ForceAttemptHTTP2)
+	requireHTTP2Configured(t, h2, "H2 模式必须显式配置 http2 keepalive")
+}
+
 // 死连接在经 HTTP 代理（CONNECT 隧道）时最高发，这是带 proxy 账号的真实生产路径：
-// 显式 http2 配置须与 Transport.Proxy 同时正确生效，不能相互干扰。
+// long_stream_h2 经 http 代理走 utls HTTPProxyDialer（DialTLSContext 内 CONNECT），
+// 仍须挂上 http2 keepalive。
 func TestBuildUpstreamTransport_LongStreamH2_WithHTTPProxy_EnablesKeepAlive(t *testing.T) {
 	proxyURL, err := url.Parse("http://127.0.0.1:8080")
 	require.NoError(t, err)
@@ -104,5 +122,5 @@ func TestBuildUpstreamTransport_LongStreamH2_WithHTTPProxy_EnablesKeepAlive(t *t
 	require.NoError(t, err)
 	require.True(t, tr.ForceAttemptHTTP2)
 	requireHTTP2Configured(t, tr, "经代理的 long_stream_h2 也必须启用 http2 keepalive")
-	require.NotNil(t, tr.Proxy, "HTTP 代理仍须通过 Transport.Proxy 生效")
+	require.NotNil(t, tr.DialTLSContext, "http 代理经指纹 dialer 的 CONNECT+TLS")
 }

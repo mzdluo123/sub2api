@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/proxy"
@@ -197,7 +198,7 @@ func (d *HTTPProxyDialer) DialTLSContext(ctx context.Context, network, addr stri
 		}
 	}
 
-	dialer := &net.Dialer{}
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
 		slog.Debug("tls_fingerprint_http_proxy_connect_failed", "error", err)
@@ -447,13 +448,40 @@ func buildClientHelloSpecFromProfile(profile *Profile) *utls.ClientHelloSpec {
 		extensions = append(extensions, &utls.UtlsGREASEExtension{})
 	}
 
+	tlsVersMin, tlsVersMax := uint16(utls.VersionTLS10), uint16(utls.VersionTLS13)
+	// Only tighten legacy version bounds when the profile explicitly sets SupportedVersions
+	// (e.g. upstream TLS1.2-only Client Hello). Built-in Node.js defaults keep 1.0..1.3.
+	if profile != nil && len(profile.SupportedVersions) > 0 {
+		tlsVersMin, tlsVersMax = resolveTLSVersionBounds(profile.SupportedVersions)
+	}
+
 	return &utls.ClientHelloSpec{
 		CipherSuites:       cipherSuites,
 		CompressionMethods: []uint8{0}, // null compression only (standard)
 		Extensions:         extensions,
-		TLSVersMax:         utls.VersionTLS13,
-		TLSVersMin:         utls.VersionTLS10,
+		TLSVersMax:         tlsVersMax,
+		TLSVersMin:         tlsVersMin,
 	}
+}
+
+// resolveTLSVersionBounds derives ClientHello legacy version bounds from the
+// profile's SupportedVersions list. When the list is empty, keep the historical
+// default (TLS 1.0 .. TLS 1.3) used by the Node.js 24.x built-in profile.
+func resolveTLSVersionBounds(versions []uint16) (min, max uint16) {
+	min, max = utls.VersionTLS10, utls.VersionTLS13
+	if len(versions) == 0 {
+		return min, max
+	}
+	min, max = versions[0], versions[0]
+	for _, v := range versions[1:] {
+		if v < min {
+			min = v
+		}
+		if v > max {
+			max = v
+		}
+	}
+	return min, max
 }
 
 // toUint8s converts []uint16 to []uint8 (for utls fields that require []uint8).

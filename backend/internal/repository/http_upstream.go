@@ -1309,6 +1309,9 @@ func newUpstreamDialer() *net.Dialer {
 // buildUpstreamTransport 构建上游请求的 Transport
 // 使用配置文件中的连接池参数，支持生产环境调优
 //
+// 默认 TLS Client Hello 固定为 tlsfingerprint.DefaultUpstreamClientHelloProfile
+// （抓包 chatgpt.com 的 TLS1.2 JA3，见该函数注释）。HTTP/2 协议模式会额外附加 ALPN。
+//
 // 参数:
 //   - settings: 连接池配置
 //   - proxyURL: 代理 URL（nil 表示直连）
@@ -1326,6 +1329,40 @@ func newUpstreamDialer() *net.Dialer {
 //   - IdleConnTimeout: 空闲连接超时（超时后关闭）
 //   - ResponseHeaderTimeout: 等待响应头超时（不影响流式传输）
 func buildUpstreamTransport(settings poolSettings, proxyURL *url.URL, protocolMode string) (*http.Transport, error) {
+	profile := tlsfingerprint.DefaultUpstreamClientHelloProfile()
+	needsH2 := protocolMode == upstreamProtocolModeLongStreamH2 || protocolMode == upstreamProtocolModeOpenAIH2
+	if needsH2 {
+		// 抓包 Client Hello 无 ALPN；HTTP/2 协商必须带 h2 ALPN，JA3 会因此与抓包略有差异。
+		profile = tlsfingerprint.WithHTTP2ALPN(profile)
+	}
+
+	// HTTPS 代理无法走 utls CONNECT 前言，回退到 stdlib Transport（仍挂显式 tls.Config）。
+	if proxyURL != nil && strings.EqualFold(proxyURL.Scheme, "https") {
+		return buildUpstreamTransportStdlib(settings, proxyURL, protocolMode, true)
+	}
+
+	transport, err := buildUpstreamTransportWithTLSFingerprint(settings, proxyURL, profile)
+	if err != nil {
+		return nil, err
+	}
+	// Fingerprint builder 默认 ForceAttemptHTTP2=false；按协议模式再覆盖。
+	switch protocolMode {
+	case upstreamProtocolModeLongStreamH2, upstreamProtocolModeOpenAIH2:
+		transport.ForceAttemptHTTP2 = true
+		if _, err := enableHTTP2KeepAlive(transport); err != nil {
+			return nil, err
+		}
+	case upstreamProtocolModeOpenAIH1, upstreamProtocolModeOpenAIH1Fallback:
+		transport.ForceAttemptHTTP2 = false
+		transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
+	}
+	return transport, nil
+}
+
+// buildUpstreamTransportStdlib 使用 net/http + crypto/tls 构建上游 Transport。
+// explicitTLS=true 时挂载与 DefaultUpstreamClientHelloProfile 对齐的 tls.Config
+// （cipher / curve / 签名算法 / TLS1.2 上下限）；无法字节级复现扩展顺序与 JA3。
+func buildUpstreamTransportStdlib(settings poolSettings, proxyURL *url.URL, protocolMode string, explicitTLS bool) (*http.Transport, error) {
 	transport := &http.Transport{
 		DialContext:           newUpstreamDialer().DialContext,
 		TLSHandshakeTimeout:   defaultUpstreamTLSHandshakeTimeout,
@@ -1334,6 +1371,9 @@ func buildUpstreamTransport(settings poolSettings, proxyURL *url.URL, protocolMo
 		MaxConnsPerHost:       settings.maxConnsPerHost,
 		IdleConnTimeout:       settings.idleConnTimeout,
 		ResponseHeaderTimeout: settings.responseHeaderTimeout,
+	}
+	if explicitTLS {
+		transport.TLSClientConfig = defaultUpstreamTLSClientConfig()
 	}
 	switch protocolMode {
 	case upstreamProtocolModeLongStreamH2, upstreamProtocolModeOpenAIH2:
@@ -1355,6 +1395,27 @@ func buildUpstreamTransport(settings poolSettings, proxyURL *url.URL, protocolMo
 		return nil, err
 	}
 	return transport, nil
+}
+
+// defaultUpstreamTLSClientConfig 将 DefaultUpstreamClientHelloProfile 映射为 crypto/tls.Config。
+// 用于 HTTPS 代理等无法挂 utls DialTLSContext 的回退路径。
+func defaultUpstreamTLSClientConfig() *tls.Config {
+	p := tlsfingerprint.DefaultUpstreamClientHelloProfile()
+	curves := make([]tls.CurveID, len(p.Curves))
+	for i, c := range p.Curves {
+		curves[i] = tls.CurveID(c)
+	}
+	sigAlgs := make([]tls.SignatureScheme, len(p.SignatureAlgorithms))
+	for i, s := range p.SignatureAlgorithms {
+		sigAlgs[i] = tls.SignatureScheme(s)
+	}
+	return &tls.Config{
+		MinVersion:       tls.VersionTLS12,
+		MaxVersion:       tls.VersionTLS12,
+		CipherSuites:     append([]uint16(nil), p.CipherSuites...),
+		CurvePreferences: curves,
+		SignatureSchemes: sigAlgs,
+	}
 }
 
 // enableHTTP2KeepAlive 在 http.Transport 上显式配置 HTTP/2 并启用连接健康探测。
@@ -1391,6 +1452,8 @@ func enableHTTP2KeepAlive(transport *http.Transport) (*http2.Transport, error) {
 //   - socks5: SOCKS5 代理，使用 SOCKS5ProxyDialer（SOCKS5 隧道 + utls 握手）
 func buildUpstreamTransportWithTLSFingerprint(settings poolSettings, proxyURL *url.URL, profile *tlsfingerprint.Profile) (*http.Transport, error) {
 	transport := &http.Transport{
+		DialContext:           newUpstreamDialer().DialContext,
+		TLSHandshakeTimeout:   defaultUpstreamTLSHandshakeTimeout,
 		MaxIdleConns:          settings.maxIdleConns,
 		MaxIdleConnsPerHost:   settings.maxIdleConnsPerHost,
 		MaxConnsPerHost:       settings.maxConnsPerHost,
@@ -1404,7 +1467,7 @@ func buildUpstreamTransportWithTLSFingerprint(settings poolSettings, proxyURL *u
 	if proxyURL == nil {
 		// 直连：使用 TLSFingerprintDialer
 		slog.Debug("tls_fingerprint_transport_direct")
-		dialer := tlsfingerprint.NewDialer(profile, nil)
+		dialer := tlsfingerprint.NewDialer(profile, newUpstreamDialer().DialContext)
 		transport.DialTLSContext = dialer.DialTLSContext
 	} else {
 		scheme := strings.ToLower(proxyURL.Scheme)
@@ -1416,8 +1479,8 @@ func buildUpstreamTransportWithTLSFingerprint(settings poolSettings, proxyURL *u
 			transport.DialTLSContext = socks5Dialer.DialTLSContext
 		case "https":
 			// The fingerprint dialer emits a plaintext CONNECT preface and cannot
-			// establish TLS to an HTTPS proxy. Keep proxy routing via net/http.
-			return buildUpstreamTransport(settings, proxyURL, upstreamProtocolModeDefault)
+			// establish TLS to an HTTPS proxy. Keep proxy routing via net/http + explicit TLS.
+			return buildUpstreamTransportStdlib(settings, proxyURL, upstreamProtocolModeDefault, true)
 		case "http":
 			// HTTP/HTTPS 代理：使用 HTTPProxyDialer（CONNECT 隧道）
 			slog.Debug("tls_fingerprint_transport_http_connect", "proxy", proxyURL.Host)

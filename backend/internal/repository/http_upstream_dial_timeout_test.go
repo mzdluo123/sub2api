@@ -33,16 +33,18 @@ func TestNewUpstreamDialerHasBoundedTimeout(t *testing.T) {
 	require.Equal(t, defaultUpstreamDialKeepAlive, dialer.KeepAlive)
 }
 
-// 建连超时对 HTTP 代理同样生效：Transport.Proxy 走的仍是 DialContext，
-// 代理地址不可达时必须快速失败而不是挂满内核超时。
+// 建连超时对 HTTP 代理同样生效：默认上游对 http 代理走 utls HTTPProxyDialer
+// （CONNECT 在 DialTLSContext 内完成，Transport.Proxy 为 nil），
+// DialContext 仍保留有超时的 dialer 供非 TLS / 回退路径使用。
 func TestBuildUpstreamTransportKeepsDialTimeoutWithHTTPProxy(t *testing.T) {
 	proxyURL, err := url.Parse("http://127.0.0.1:1080")
 	require.NoError(t, err)
 
 	transport, err := buildUpstreamTransport(defaultPoolSettings(nil), proxyURL, upstreamProtocolModeDefault)
 	require.NoError(t, err)
-	require.NotNil(t, transport.Proxy)
+	require.NotNil(t, transport.DialTLSContext, "http 代理必须走指纹 DialTLSContext")
 	require.NotNil(t, transport.DialContext)
+	require.Equal(t, defaultUpstreamTLSHandshakeTimeout, transport.TLSHandshakeTimeout)
 }
 
 // SOCKS5 分支会覆盖 Transport.DialContext，覆盖后仍必须是有超时的拨号器。
